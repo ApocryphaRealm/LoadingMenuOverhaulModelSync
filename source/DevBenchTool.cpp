@@ -92,17 +92,9 @@ namespace DevBenchTool
 			{
 				// Ask the movie for another hint exactly as Loading Menu Overhaul's button does; the
 				// sync then sees the new text on the next AdvanceMovie and swaps the model.
-				bool ok = false;
-				bool viaTask = true;
-				if (!RunOnMainThread([&]() { ok = modelsync::RequestNextHint(); }, 1500))
-				{
-					// During a load the game's task queue may not be serviced; the movie invoke is a
-					// single Scaleform call, so make it directly rather than report nothing.
-					viaTask = false;
-					logger::warn("op=next: the task queue did not run within 1.5 s; invoking the movie directly from the DevBench thread");
-					ok = modelsync::RequestNextHint();
-				}
-				(void)viaTask;
+				// Queues the swipe; the menu performs it on the game's thread. Never invoked from
+				// here: doing so crashed the engine's model loader on this thread (run 7, 2026-09-17).
+				const bool ok = modelsync::RequestNextHint();
 				a_write(a_sink, std::format("{{\"ok\":{},\"op\":\"next\",{}}}", ok ? "true" : "false", modelsync::StateJson()).c_str());
 				return;
 			}
@@ -117,12 +109,15 @@ namespace DevBenchTool
 					a_write(a_sink, R"json({"ok":false,"op":"apply","error":"need formid, in hex"})json");
 					return;
 				}
-				bool ok = false;
-				RunOnMainThread([&]() {
+				// The result lives in a shared_ptr, never in a local captured by reference: a task the
+				// game thread runs AFTER this request has timed out and returned would otherwise write
+				// into a dead frame (that is exactly what crashed run 9, 2026-09-17, on the state op).
+				auto ok = std::make_shared<std::atomic<bool>>(false);
+				const bool ran = RunOnMainThread([ok, formID]() {
 					auto* screen = RE::TESForm::LookupByID<RE::TESLoadScreen>(formID);
-					ok = screen && modelsync::ApplyScreen(screen, "devbench");
+					ok->store(screen && modelsync::ApplyScreen(screen, "devbench"));
 				});
-				a_write(a_sink, std::format("{{\"ok\":{},\"op\":\"apply\",\"formid\":\"{:08X}\",{}}}", ok ? "true" : "false", formID, modelsync::StateJson()).c_str());
+				a_write(a_sink, std::format("{{\"ok\":{},\"ran\":{},\"op\":\"apply\",\"formid\":\"{:08X}\",{}}}", ok->load() ? "true" : "false", ran ? "true" : "false", formID, modelsync::StateJson()).c_str());
 				return;
 			}
 			if (op == "set")
@@ -140,10 +135,10 @@ namespace DevBenchTool
 				return;
 			}
 
-			std::string state;
-			RunOnMainThread([&]() { state = modelsync::StateJson(); }, 2000);
-			if (state.empty()) { state = modelsync::StateJson(); }
-			a_write(a_sink, std::format("{{\"ok\":true,\"op\":\"state\",{}}}", state).c_str());
+			// Read on this thread. StateJson reads atomics and copies its strings under a lock; it does
+			// not need the game thread, and asking the game thread for it during a load is what
+			// produced the dangling-reference crash of run 9.
+			a_write(a_sink, std::format("{{\"ok\":true,\"op\":\"state\",{}}}", modelsync::StateJson()).c_str());
 		}
 	}
 

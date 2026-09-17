@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <cmath>
+#include <cstring>
 #include <fstream>
 #include <mutex>
 #include <string>
@@ -37,6 +38,7 @@ namespace modelsync
 		using SetModelFn = void (*)(RE::TESModel*, float, const RE::NiPoint3*, const RE::NiPoint3*, const char*, float, float);
 
 		Settings g_settings;
+		std::mutex g_stateLock;   // guards State::lastText and State::textPathUsed across threads
 
 		struct State
 		{
@@ -48,6 +50,8 @@ namespace modelsync
 			std::uintptr_t requestedPathAddr{ 0 };
 			std::uintptr_t loadedPathAddr{ 0 };
 			REL::Relocation<decltype(&RE::IMenu::AdvanceMovie)> originalAdvanceMovie;
+			REL::Relocation<decltype(&RE::IMenu::Accept)> originalAccept;
+			REL::Relocation<decltype(&RE::IMenu::ProcessMessage)> originalProcessMessage;
 
 			std::unordered_map<std::string, std::vector<RE::TESLoadScreen*>> byText;
 			std::size_t screens{ 0 };
@@ -196,6 +200,7 @@ namespace modelsync
 				{
 					const char* s = v.GetString();
 					a_out = s ? s : "";
+					std::scoped_lock l(g_stateLock);
 					if (g.textPathUsed != path)
 					{
 						g.textPathUsed = path;
@@ -256,9 +261,14 @@ namespace modelsync
 			if (!ReadHint(a_movie, raw)) { return; }
 			const std::string text = Normalise(raw);
 
-			if (text != g.lastText)
+			bool changed = false;
 			{
-				g.lastText = text;
+				std::scoped_lock l(g_stateLock);
+				changed = text != g.lastText;
+				if (changed) { g.lastText = text; }
+			}
+			if (changed)
+			{
 				if (!g.firstTextSeen)
 				{
 					// The first hint after the menu opens belongs to the screen the engine already
@@ -328,13 +338,177 @@ namespace modelsync
 		// during a cell load rather than leaving it to be inferred from silence.
 		std::atomic<std::uint32_t> g_ticksMenu{ 0 }, g_ticksAdvance{ 0 }, g_ticksDisplay{ 0 }, g_advanceOther{ 0 };
 
+		// ---- the swipe itself. During a cell load nothing advances the loading movie through a
+		// path we can hook per frame (run 4, 2026-09-17: the movie answers the probe exactly once, at
+		// the end of the load). But every swipe Loading Menu Overhaul makes is a GameDelegate call to
+		// "RequestLoadingText", the callback the menu registers in Accept(). So Accept is hooked, the
+		// registration is wrapped, and every request passes through here: the engine's handler runs
+		// (it returns the text and erases the picked screen from loadScreens), the erased screen is
+		// the pick, and its model is applied on the spot - on the thread that runs the Flash call.
+		using CallbackFn = RE::FxDelegateHandler::CallbackFn;
+		CallbackFn* g_origRequestLoadingText = nullptr;
+		std::atomic<std::uint32_t> g_requests{ 0 }, g_picked{ 0 }, g_msgUpdate{ 0 }, g_msgOther{ 0 };
+		// Swipes the DevBench tool asked for, performed on the game's thread when the menu next
+		// processes a message. Run 7 (2026-09-17): invoking the movie from the DevBench thread reached
+		// the engine's model loader on that thread and crashed it (56661 <- 51454 <- our Apply).
+		std::atomic<std::uint32_t> g_pendingNext{ 0 };
+		std::atomic<std::uint32_t> g_servedNext{ 0 };
+
+		// A pick deferred because the previous model was still loading is applied at the next
+		// opportunity the game thread gives us - any menu message or advance - not only on kUpdate.
+		void RetryDeferred(const char* a_why)
+		{
+			if (!g.resolved || !g.wanted || g.wanted == g.current || LoadPending()) { return; }
+			if (Apply(g.wanted, a_why))
+			{
+				g.current = g.wanted;
+				++g.applied;
+				g.pendingFrames = 0;
+			}
+			else { ++g.retries; }
+		}
+
+		void ServePendingNext(RE::LoadingMenu* a_menu)
+		{
+			RetryDeferred("deferred");
+			if (!a_menu || !a_menu->uiMovie || g_pendingNext.load() == 0) { return; }
+			--g_pendingNext;
+			++g_servedNext;
+			const bool ok = a_menu->uiMovie->Invoke("_root.Menu_mc.refreshLoadingText", nullptr, nullptr, 0);
+			logger::debug("served a queued swipe on the game thread (refreshLoadingText -> {})", ok);
+		}
+
+		void RequestLoadingText(const RE::FxDelegateArgs& a_args)
+		{
+			auto* menu = static_cast<RE::LoadingMenu*>(static_cast<RE::IMenu*>(a_args.GetHandler()));
+			++g_requests;
+			std::vector<RE::TESLoadScreen*> before;
+			RE::TESLoadScreen* prePick = nullptr;
+			if (menu)
+			{
+				auto& rd = menu->GetRuntimeData();
+				// unk78 in this CommonLib line; 7.x names it loadScreen - the pre-picked TESLoadScreen*
+				prePick = reinterpret_cast<RE::TESLoadScreen*>(rd.unk78);
+				for (auto* s : rd.loadScreens) { before.push_back(s); }
+			}
+			if (g_origRequestLoadingText) { g_origRequestLoadingText(a_args); }
+			if (!menu || !g_settings.enabled || !g.resolved) { return; }
+
+			if (prePick)
+			{
+				// the first request after the menu opens returns the pre-picked screen's text; its
+				// model is the one the engine already put up
+				g.current = prePick;
+				g.wanted = prePick;
+				g.firstTextSeen = true;
+				logger::debug("swipe: first request answered with the pre-picked screen {} (model already up)", ScreenName(prePick));
+				return;
+			}
+			auto& rd = menu->GetRuntimeData();
+			RE::TESLoadScreen* chosen = nullptr;
+			for (auto* s : before)
+			{
+				bool still = false;
+				for (auto* t : rd.loadScreens) { if (t == s) { still = true; break; } }
+				if (!still) { chosen = s; break; }
+			}
+			if (!chosen)
+			{
+				logger::debug("swipe: request {} erased nothing from loadScreens ({} left) - no pick to follow", g_requests.load(), rd.loadScreens.size());
+				return;
+			}
+			++g_picked;
+			g.wanted = chosen;
+			g.firstTextSeen = true;
+			if (LoadPending())
+			{
+				++g.retries;
+				logger::debug("swipe: picked {} but a model load is still pending; deferred", ScreenName(chosen));
+				return;
+			}
+			if (Apply(chosen, "swipe"))
+			{
+				g.current = chosen;
+				++g.applied;
+			}
+			else { ++g.retries; }
+		}
+
+		struct Processor : RE::FxDelegateHandler::CallbackProcessor
+		{
+			RE::FxDelegateHandler::CallbackProcessor* inner{ nullptr };
+			void Process(const RE::GString& a_name, CallbackFn* a_fn) override
+			{
+				logger::debug("Accept registers \"{}\" -> +{:#x}", a_name.c_str() ? a_name.c_str() : "(null)", reinterpret_cast<std::uintptr_t>(a_fn) - REL::Module::get().base());
+				if (a_name.c_str() && std::strcmp(a_name.c_str(), "RequestLoadingText") == 0)
+				{
+					g_origRequestLoadingText = a_fn;
+					inner->Process(a_name, &RequestLoadingText);
+					logger::debug("RequestLoadingText registration wrapped (engine handler +{:#x})", reinterpret_cast<std::uintptr_t>(a_fn) - REL::Module::get().base());
+					return;
+				}
+				inner->Process(a_name, a_fn);
+			}
+		};
+
+		// The Loading Menu is an always-open menu: one instance, created at start-up, before any
+		// plugin's kDataLoaded, and its Accept() ran once then (runs 5 and 6, 2026-09-17: the Accept
+		// hook was installed and never called). So the registration is rewritten where it already
+		// sits - the CallbackDefn for "RequestLoadingText" in the menu's own FxDelegate table.
+		bool WrapDelegate(RE::LoadingMenu* a_menu)
+		{
+			if (!a_menu) { return false; }
+			auto* del = a_menu->fxDelegate.get();
+			if (!del)
+			{
+				logger::warn("the Loading Menu has no FxDelegate; the swipe cannot be followed");
+				return false;
+			}
+			RE::GString key("RequestLoadingText");
+			auto* defn = del->callbacks.Get(key);
+			if (!defn)
+			{
+				std::string names;
+				for (auto it = del->callbacks.begin(); it != del->callbacks.end(); ++it) { names += it->first.c_str() ? it->first.c_str() : "?"; names += ' '; }
+				logger::warn("the Loading Menu's delegate table has no RequestLoadingText; it holds: {}", names);
+				return false;
+			}
+			if (defn->callback == &RequestLoadingText) { return true; }
+			g_origRequestLoadingText = defn->callback;
+			defn->callback = &RequestLoadingText;
+			logger::info("RequestLoadingText rewired in the Loading Menu's delegate table (engine handler +{:#x})",
+						 reinterpret_cast<std::uintptr_t>(g_origRequestLoadingText) - REL::Module::get().base());
+			return true;
+		}
+
 		struct Hook
 		{
+			static void Accept(RE::LoadingMenu* a_this, RE::FxDelegateHandler::CallbackProcessor* a_processor)
+			{
+				logger::debug("LoadingMenu::Accept called (menu {:#x})", reinterpret_cast<std::uintptr_t>(a_this));
+				Processor p;
+				p.inner = a_processor;
+				g.originalAccept(a_this, &p);
+			}
+
+			static RE::UI_MESSAGE_RESULTS ProcessMessage(RE::LoadingMenu* a_this, RE::UIMessage& a_message)
+			{
+				if (a_message.type.get() == RE::UI_MESSAGE_TYPE::kUpdate)
+				{
+					++g_msgUpdate;
+					if (a_this && a_this->uiMovie) { Tick(a_this->uiMovie.get()); }
+				}
+				else { ++g_msgOther; }
+				ServePendingNext(a_this);
+				return g.originalProcessMessage(a_this, a_message);
+			}
+
 			static void AdvanceMovie(RE::LoadingMenu* a_this, float a_interval, std::uint32_t a_currentTime)
 			{
 				g.originalAdvanceMovie(a_this, a_interval, a_currentTime);
 				++g_ticksMenu;
 				if (a_this && a_this->uiMovie) { Tick(a_this->uiMovie.get()); }
+				ServePendingNext(a_this);
 			}
 
 			static float MovieAdvance(RE::GFxMovieView* a_this, float a_deltaT, std::uint32_t a_frameCatchUpCount)
@@ -397,6 +571,7 @@ namespace modelsync
 		g_loadingMenu.store(menu.get());
 		g_loadingMovie.store(menu->uiMovie.get());
 		g_ticksMenu = g_ticksAdvance = g_ticksDisplay = 0;
+		if (g.resolved) { WrapDelegate(menu.get()); }
 		logger::debug("Loading Menu {:#x} movie {:#x} noted", reinterpret_cast<std::uintptr_t>(menu.get()), reinterpret_cast<std::uintptr_t>(menu->uiMovie.get()));
 		if (g.resolved) { PatchMovieVtable(menu->uiMovie.get()); }
 	}
@@ -430,7 +605,7 @@ namespace modelsync
 
 	void Reset()
 	{
-		g.lastText.clear();
+		{ std::scoped_lock l(g_stateLock); g.lastText.clear(); }
 		g.firstTextSeen = false;
 		g.current = nullptr;
 		g.wanted = nullptr;
@@ -476,6 +651,15 @@ namespace modelsync
 
 		REL::Relocation<std::uintptr_t> vtable{ RE::VTABLE_LoadingMenu[0] };
 		g.originalAdvanceMovie = vtable.write_vfunc(0x5, &Hook::AdvanceMovie);
+		g.originalAccept = vtable.write_vfunc(0x1, &Hook::Accept);
+		g.originalProcessMessage = vtable.write_vfunc(0x4, &Hook::ProcessMessage);
+		logger::info("LoadingMenu::Accept (slot 1) and ProcessMessage (slot 4) hooked");
+		if (auto* ui = RE::UI::GetSingleton())
+		{
+			auto menu = ui->GetMenu<RE::LoadingMenu>();
+			if (menu) { WrapDelegate(menu.get()); }
+			else { logger::debug("the Loading Menu instance does not exist yet; its delegate will be rewired when it first opens"); }
+		}
 		logger::info("LoadingMenu::AdvanceMovie hooked (vtable slot 5)");
 	}
 
@@ -494,22 +678,26 @@ namespace modelsync
 
 	bool RequestNextHint()
 	{
-		auto* ui = RE::UI::GetSingleton();
-		if (!ui) { return false; }
-		auto menu = ui->GetMenu(RE::LoadingMenu::MENU_NAME);
-		if (!menu || !menu->uiMovie)
+		// Queued, never invoked from the caller's thread: the menu performs it when it next processes
+		// a message or advances, on the game's own thread (see g_pendingNext).
+		if (!g_loadingMenu.load())
 		{
-			logger::info("RequestNextHint: the Loading Menu is not open");
+			logger::info("RequestNextHint: the Loading Menu is not open; nothing queued");
 			return false;
 		}
-		// Loading Menu Overhaul's own refresh: GameDelegate RequestLoadingText -> SetLoadingText.
-		const bool ok = menu->uiMovie->Invoke("_root.Menu_mc.refreshLoadingText", nullptr, nullptr, 0);
-		logger::debug("RequestNextHint: Invoke refreshLoadingText -> {}", ok);
-		return ok;
+		++g_pendingNext;
+		logger::debug("RequestNextHint: queued ({} pending)", g_pendingNext.load());
+		return true;
 	}
 
 	std::string StateJson()
 	{
+		std::string textPath, lastText;
+		{
+			std::scoped_lock l(g_stateLock);
+			textPath = g.textPathUsed;
+			lastText = g.lastText.substr(0, 80);
+		}
 		auto esc = [](std::string_view s) {
 			std::string o;
 			for (const char c : s) { if (c == '"' || c == '\\') { o += '\\'; } if (c != '\r' && c != '\n') { o += c; } }
@@ -519,10 +707,12 @@ namespace modelsync
 			"\"installed\":{},\"runtimeSupported\":{},\"resolved\":{},\"enabled\":{},\"screens\":{},\"screensWithText\":{},"
 			"\"distinctTexts\":{},\"textPath\":\"{}\",\"lastText\":\"{}\",\"current\":\"{}\",\"wanted\":\"{}\","
 			"\"applied\":{},\"retries\":{},\"pendingFrames\":{},\"unmatched\":{},\"loadPending\":{},\"requestedPath\":\"{}\","
-			"\"ticksMenu\":{},\"ticksAdvance\":{},\"ticksDisplay\":{},\"advanceOther\":{},\"movieNoted\":{}",
+			"\"ticksMenu\":{},\"ticksAdvance\":{},\"ticksDisplay\":{},\"advanceOther\":{},\"movieNoted\":{},"
+			"\"requests\":{},\"picked\":{},\"msgUpdate\":{},\"msgOther\":{},\"pendingNext\":{},\"servedNext\":{}",
 			g.installed, g.runtimeSupported, g.resolved, g_settings.enabled, g.screens, g.screensWithText, g.byText.size(),
-			esc(g.textPathUsed), esc(g.lastText.substr(0, 80)), ScreenName(g.current), ScreenName(g.wanted),
+			esc(textPath), esc(lastText), ScreenName(g.current), ScreenName(g.wanted),
 			g.applied, g.retries, g.pendingFrames, g.unmatched, g.resolved ? LoadPending() : false, esc(RequestedPath()),
-			g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr);
+			g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr,
+			g_requests.load(), g_picked.load(), g_msgUpdate.load(), g_msgOther.load(), g_pendingNext.load(), g_servedNext.load());
 	}
 }
