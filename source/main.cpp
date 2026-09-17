@@ -26,6 +26,7 @@ namespace
 			{
 				logger::debug("Loading Menu {}", a_event->opening ? "opened" : "closed");
 				modelsync::Reset();
+				modelsync::NoteLoadingMenu(a_event->opening);
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}

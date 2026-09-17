@@ -35,6 +35,10 @@ namespace modelsync
 	// Forget the last seen text; called when the Loading Menu opens or closes.
 	void Reset();
 
+	// Remember (or forget) the Loading Menu and its movie, and hook the movie's Advance the first
+	// time it is seen. Called from the menu open/close event.
+	void NoteLoadingMenu(bool a_open);
+
 	// Apply a load screen's model now, by hand (DevBench). Returns false if it has no model or the
 	// engine function is not resolved.
 	bool ApplyScreen(RE::TESLoadScreen* a_screen, const char* a_why);

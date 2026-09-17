@@ -3,8 +3,10 @@
 #include "ModelSync.h"
 #include "utils/Logger.h"
 
+#include <atomic>
 #include <cmath>
 #include <fstream>
+#include <mutex>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -177,9 +179,9 @@ namespace modelsync
 			return accepted;
 		}
 
-		bool ReadHint(RE::LoadingMenu* a_menu, std::string& a_out)
+		bool ReadHint(RE::GFxMovieView* a_movie, std::string& a_out)
 		{
-			auto movie = a_menu->uiMovie;
+			auto* movie = a_movie;
 			if (!movie) { return false; }
 			// Loading Menu Overhaul's class keeps the text field in a member (LoadingText); the vanilla
 			// movie names the instance path. Ask for both, remember which one answered (rule 30).
@@ -205,12 +207,53 @@ namespace modelsync
 			return false;
 		}
 
-		void Tick(RE::LoadingMenu* a_menu)
+		// Is this Scaleform movie the loading menu's? Decided by asking it (rule 30): the loading
+		// menu's root clip has a LoadingText member; nothing else does. Cached per movie pointer
+		// while a Loading Menu is up, cleared when it opens or closes. This is how the movie is
+		// recognised during a cell load, where the pointer the menu object holds turned out NOT to be
+		// the one the loading code advances (2026-09-17: 3235 Advance calls on other movies, none on
+		// the noted pointer, while the swipe visibly worked).
+		std::mutex g_probeLock;
+		std::unordered_map<RE::GFxMovieView*, bool> g_probe;
+
+		bool IsLoadingMovie(RE::GFxMovieView* a_movie)
+		{
+			if (!a_movie) { return false; }
+			{
+				std::scoped_lock l(g_probeLock);
+				auto it = g_probe.find(a_movie);
+				if (it != g_probe.end()) { return it->second; }
+			}
+			// Several spellings, and the answer types, logged - so a run says exactly what each movie
+			// advanced during a load answers, instead of leaving a silent miss to be guessed at.
+			RE::GFxValue v1, v2, v3;
+			const bool hasText = a_movie->GetVariable(&v1, "_root.Menu_mc.LoadingText");
+			const bool hasMenu = a_movie->GetVariable(&v2, "_root.Menu_mc");
+			const bool hasRoot = a_movie->GetVariable(&v3, "_root");
+			const bool is = (hasText && (v1.IsObject() || v1.IsDisplayObject())) || (hasMenu && (v2.IsObject() || v2.IsDisplayObject()) && hasText);
+			std::scoped_lock l(g_probeLock);
+			g_probe[a_movie] = is;
+			if (g_probe.size() <= 24)
+			{
+				logger::debug("probe movie {:#x}: _root={} ({}), _root.Menu_mc={} ({}), LoadingText={} ({}) -> {}",
+							  reinterpret_cast<std::uintptr_t>(a_movie), hasRoot, static_cast<int>(v3.GetType()), hasMenu, static_cast<int>(v2.GetType()),
+							  hasText, static_cast<int>(v1.GetType()), is ? "LOADING MENU" : "other");
+			}
+			return is;
+		}
+
+		void ClearProbe()
+		{
+			std::scoped_lock l(g_probeLock);
+			g_probe.clear();
+		}
+
+		void Tick(RE::GFxMovieView* a_movie)
 		{
 			if (!g_settings.enabled || !g.resolved) { return; }
 
 			std::string raw;
-			if (!ReadHint(a_menu, raw)) { return; }
+			if (!ReadHint(a_movie, raw)) { return; }
 			const std::string text = Normalise(raw);
 
 			if (text != g.lastText)
@@ -265,14 +308,97 @@ namespace modelsync
 			}
 		}
 
+		// The per-frame tick. IMenu::AdvanceMovie on the LoadingMenu is only called while the game's
+		// main loop runs the menus - the load from the main menu, not a cell transition, whose loading
+		// screen is advanced by the loading code calling the Scaleform movie's own Advance directly
+		// (seen 2026-09-17: the vtable-5 hook logged the first hint on the save load and nothing at all
+		// during four coc loads). So the movie's GFxMovieView::Advance (slot 0x25 of the concrete
+		// movie's vtable, patched at runtime the first time the Loading Menu is seen) is hooked too, and
+		// filtered to the Loading Menu's own movie. Both paths call Tick; whichever runs, runs.
+		using MovieAdvanceFn = float (*)(RE::GFxMovieView*, float, std::uint32_t);
+		using MovieDisplayFn = void (*)(RE::GFxMovieView*);
+		MovieAdvanceFn g_originalMovieAdvance = nullptr;
+		MovieDisplayFn g_originalMovieDisplay = nullptr;
+		std::atomic<RE::GFxMovieView*> g_loadingMovie{ nullptr };
+		std::atomic<RE::LoadingMenu*> g_loadingMenu{ nullptr };
+		bool g_moviePatched = false;
+		inline constexpr std::size_t kMovieAdvanceSlot = 0x25;
+		inline constexpr std::size_t kMovieDisplaySlot = 0x26;
+		// Which path is actually ticking, per Loading Menu - so a run says which hook the engine uses
+		// during a cell load rather than leaving it to be inferred from silence.
+		std::atomic<std::uint32_t> g_ticksMenu{ 0 }, g_ticksAdvance{ 0 }, g_ticksDisplay{ 0 }, g_advanceOther{ 0 };
+
 		struct Hook
 		{
 			static void AdvanceMovie(RE::LoadingMenu* a_this, float a_interval, std::uint32_t a_currentTime)
 			{
 				g.originalAdvanceMovie(a_this, a_interval, a_currentTime);
-				if (a_this) { Tick(a_this); }
+				++g_ticksMenu;
+				if (a_this && a_this->uiMovie) { Tick(a_this->uiMovie.get()); }
+			}
+
+			static float MovieAdvance(RE::GFxMovieView* a_this, float a_deltaT, std::uint32_t a_frameCatchUpCount)
+			{
+				const float r = g_originalMovieAdvance ? g_originalMovieAdvance(a_this, a_deltaT, a_frameCatchUpCount) : 0.0f;
+				if (g_loadingMenu.load() && IsLoadingMovie(a_this))
+				{
+					++g_ticksAdvance;
+					Tick(a_this);
+				}
+				else { ++g_advanceOther; }
+				return r;
+			}
+
+			static void MovieDisplay(RE::GFxMovieView* a_this)
+			{
+				if (g_originalMovieDisplay) { g_originalMovieDisplay(a_this); }
+				if (g_loadingMenu.load() && IsLoadingMovie(a_this))
+				{
+					++g_ticksDisplay;
+					Tick(a_this);
+				}
 			}
 		};
+
+		void PatchMovieVtable(RE::GFxMovieView* a_movie)
+		{
+			if (g_moviePatched || !a_movie) { return; }
+			auto** vtable = *reinterpret_cast<void***>(a_movie);
+			if (!vtable) { return; }
+			g_originalMovieAdvance = reinterpret_cast<MovieAdvanceFn>(vtable[kMovieAdvanceSlot]);
+			g_originalMovieDisplay = reinterpret_cast<MovieDisplayFn>(vtable[kMovieDisplaySlot]);
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[kMovieAdvanceSlot]), reinterpret_cast<std::uintptr_t>(&Hook::MovieAdvance));
+			REL::safe_write(reinterpret_cast<std::uintptr_t>(&vtable[kMovieDisplaySlot]), reinterpret_cast<std::uintptr_t>(&Hook::MovieDisplay));
+			g_moviePatched = true;
+			logger::info("GFxMovieView::Advance and Display hooked on the loading movie's vtable (slots {:#x}/{:#x}, originals +{:#x}/+{:#x}, vtable +{:#x})",
+						 kMovieAdvanceSlot, kMovieDisplaySlot,
+						 reinterpret_cast<std::uintptr_t>(g_originalMovieAdvance) - REL::Module::get().base(),
+						 reinterpret_cast<std::uintptr_t>(g_originalMovieDisplay) - REL::Module::get().base(),
+						 reinterpret_cast<std::uintptr_t>(vtable) - REL::Module::get().base());
+		}
+	}
+
+	void NoteLoadingMenu(bool a_open)
+	{
+		ClearProbe();
+		if (!a_open)
+		{
+			g_loadingMovie.store(nullptr);
+			g_loadingMenu.store(nullptr);
+			return;
+		}
+		auto* ui = RE::UI::GetSingleton();
+		auto menu = ui ? ui->GetMenu<RE::LoadingMenu>() : nullptr;
+		if (!menu || !menu->uiMovie)
+		{
+			logger::warn("Loading Menu opened but its menu or movie could not be fetched; this load will not be synced");
+			return;
+		}
+		g_loadingMenu.store(menu.get());
+		g_loadingMovie.store(menu->uiMovie.get());
+		g_ticksMenu = g_ticksAdvance = g_ticksDisplay = 0;
+		logger::debug("Loading Menu {:#x} movie {:#x} noted", reinterpret_cast<std::uintptr_t>(menu.get()), reinterpret_cast<std::uintptr_t>(menu->uiMovie.get()));
+		if (g.resolved) { PatchMovieVtable(menu->uiMovie.get()); }
 	}
 
 	Settings& GetSettings() { return g_settings; }
@@ -392,9 +518,11 @@ namespace modelsync
 		return std::format(
 			"\"installed\":{},\"runtimeSupported\":{},\"resolved\":{},\"enabled\":{},\"screens\":{},\"screensWithText\":{},"
 			"\"distinctTexts\":{},\"textPath\":\"{}\",\"lastText\":\"{}\",\"current\":\"{}\",\"wanted\":\"{}\","
-			"\"applied\":{},\"retries\":{},\"pendingFrames\":{},\"unmatched\":{},\"loadPending\":{},\"requestedPath\":\"{}\"",
+			"\"applied\":{},\"retries\":{},\"pendingFrames\":{},\"unmatched\":{},\"loadPending\":{},\"requestedPath\":\"{}\","
+			"\"ticksMenu\":{},\"ticksAdvance\":{},\"ticksDisplay\":{},\"advanceOther\":{},\"movieNoted\":{}",
 			g.installed, g.runtimeSupported, g.resolved, g_settings.enabled, g.screens, g.screensWithText, g.byText.size(),
 			esc(g.textPathUsed), esc(g.lastText.substr(0, 80)), ScreenName(g.current), ScreenName(g.wanted),
-			g.applied, g.retries, g.pendingFrames, g.unmatched, g.resolved ? LoadPending() : false, esc(RequestedPath()));
+			g.applied, g.retries, g.pendingFrames, g.unmatched, g.resolved ? LoadPending() : false, esc(RequestedPath()),
+			g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr);
 	}
 }
