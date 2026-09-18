@@ -1,6 +1,11 @@
 # Changelog - Loading Menu Overhaul Model Sync
 
-## 1.0.1 - 2026-09-18 - untested
+## 1.0.2 - 2026-09-18 - untested
+
+### Fixed
+- **The Address Library guard now runs before SKSE::Init.** CommonLibSSE-NG's Init opens the Address Library itself, so the guard added for a missing file sat after the very call that fails on it and never ran; oproso's log (Perfected Wheeler 1.3.2, 2026-09-18) showed the banner, then CommonLib's bare 'failed to open address library file', and no [AddressLibrary] line. The check is now the first thing after the logger, so a missing file is named - game version, file, folder - and the plugin loads inert.
+
+## 1.0.1 - 2026-09-18 - working
 
 ### Added
 - **A minimum loading-screen time** (the owner: a settings page with a minimum the player can set, default 20 seconds). The game-load loop's state check (id 38085) and the cell transition's wait (id 39366) are held until the time has passed, so the swapped model is on screen long enough to be seen on a fast machine. Settings page inside Apocrypha Menu Framework: swap on/off, minimum on/off and seconds, log level; INI `[MinimumTime] bMinimumLoadingTime`, `fMinimumLoadingSeconds`.

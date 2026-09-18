@@ -61,15 +61,16 @@ namespace
 
 SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
-	SKSE::Init(a_skse);
 	SKSE::log::init(modelsync::kLogName);
 	// Address Library pre-check (the guard every mod of ours carries): when the file for this game is
 	// missing the plugin loads inert with a message that names it, instead of CommonLib's unreadable fail.
+	// The minimum-time hooks write three 5-byte calls through the trampoline.
+	// The guard runs BEFORE SKSE::Init: CommonLibSSE-NG's Init opens the Address Library itself, so a guard placed after it never ran when the file was missing (oproso's wheeler.log, 2026-09-18 - banner, then the bare failure, no [AddressLibrary] line).
 	if (!AddressLibraryGuard::Guard("Loading Menu Overhaul Model Sync"))
 	{
 		return true;
 	}
-	// The minimum-time hooks write three 5-byte calls through the trampoline.
+	SKSE::Init(a_skse);
 	SKSE::AllocTrampoline(64);
 
 	modelsync::LoadSettings();
