@@ -157,7 +157,7 @@ namespace DevBenchTool
 
 		constexpr const char* descriptor =
 			"{"
-			"\"description\":\"Loading Menu Overhaul - Model Sync. op=state (default): whether the hook is installed, "
+			"\"description\":\"Loading Menu Overhaul Model Sync. op=state (default): whether the hook is installed, "
 			"the engine function resolved, the hint text last seen, the load screen whose model is up, and counts of "
 			"swaps applied and retried. op=next: while the Loading Menu is open, ask the movie for the next hint the way "
 			"Loading Menu Overhaul's swipe does, so the sync swaps the model. op=apply with formid (hex): force that load "

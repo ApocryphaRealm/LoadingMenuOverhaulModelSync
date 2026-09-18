@@ -43,6 +43,11 @@ namespace modelsync
 		using SetModelFn = void (*)(RE::TESModel*, float, const RE::NiPoint3*, const RE::NiPoint3*, const char*, float, float);
 
 		Settings g_settings;
+		std::atomic<std::uint64_t> g_ticksLoop{ 0 };   // OnLoadingFrame calls (the loading-screen loop, drawing thread)
+		std::atomic<std::uint32_t> g_pickedThisScreen{ 0 };   // swipe picks since this Loading Menu opened
+		std::unordered_map<std::string, RE::TESLoadScreen*> g_shownScreens;   // hint text -> the screen shown for it on this Loading Menu (back swipes)
+		std::uint64_t g_lastSetPass = 0;   // loop pass of the last SetModel call (0 = none this screen)
+		std::uint64_t g_nextTryPass = 0;   // loop pass before which a failed or fresh swap is not retried
 		std::mutex g_stateLock;   // guards State::lastText and State::textPathUsed across threads
 
 		struct State
@@ -211,7 +216,28 @@ namespace modelsync
 				offset1 = static_cast<float>(nif->rotationOffsetConstraints[1]);
 			}
 
+			// The engine's setter refuses a call while (scene flag 0x135 && requested != loaded). Measured
+			// 2026-09-18 on Njordlinger: 'loaded' (519829) stays at the main menu's "Interface/Logo/Logo.nif"
+			// for the whole loading screen although the requested model is on screen - whatever normally
+			// writes it does not run here (Loading Menu Overhaul drives this screen) - so the setter refused
+			// every swap ("NOT accepted" x4 in one screen). Once the requested model has demonstrably been
+			// up for a while (the flag is set and 60 loop passes have gone by since the menu opened), the
+			// bookkeeping is brought in line - loaded := requested, through BSFixedString so the refcounts
+			// are right - and the setter accepts the swap it would otherwise ignore for ever.
+			if (g.scenePtrAddr && g.requestedPathAddr && g.loadedPathAddr && g_ticksLoop.load() >= g_lastSetPass + 8)
+			{
+				const auto scene = *reinterpret_cast<std::uint8_t**>(g.scenePtrAddr);
+				auto& requested = *reinterpret_cast<RE::BSFixedString*>(g.requestedPathAddr);
+				auto& loaded = *reinterpret_cast<RE::BSFixedString*>(g.loadedPathAddr);
+				if (scene && scene[0x135] != 0 && requested != loaded)
+				{
+					logger::info("{}: the engine still lists \"{}\" as loaded while \"{}\" has been up for {} passes; marking it loaded so the setter accepts a swap",
+								a_why, loaded.c_str() ? loaded.c_str() : "", requested.c_str() ? requested.c_str() : "", g_ticksLoop.load());
+					loaded = requested;
+				}
+			}
 			g.setModel(model, scale, &rotation, &translation, camera, offset0, offset1);
+			g_lastSetPass = g_ticksLoop.load();
 			const std::string after = RequestedPath();
 			const bool accepted = model ? (after == modelPath) : true;
 			logger::info("{}: set model \"{}\" scale {:.2f} rot ({:.2f},{:.2f},{:.2f}) trans ({:.1f},{:.1f},{:.1f}) cam \"{}\" off {}/{} -> {}",
@@ -318,6 +344,15 @@ namespace modelsync
 				}
 				else if (!text.empty())
 				{
+					// The text path is how a BACK swipe is followed: Loading Menu Overhaul shows a previous hint
+					// from its own history without asking the engine for a screen, so no pick arrives - only the
+					// text changes (the owner, 2026-09-18: 'doesnt like it when i go in reverse order'). A text
+					// already shown on this screen goes back to the very screen it had, so the model returns.
+					if (auto seen = g_shownScreens.find(text); seen != g_shownScreens.end())
+					{
+						if (seen->second != g.current) { g.wanted = seen->second; logger::debug("hint back to \"{}\" -> {} (shown before on this screen)", text.substr(0, 60), ScreenName(seen->second)); }
+						return;
+					}
 					auto it = g.byText.find(text);
 					if (it == g.byText.end())
 					{
@@ -327,7 +362,8 @@ namespace modelsync
 					else
 					{
 						RE::TESLoadScreen* pick = nullptr;
-						for (auto* s : it->second) { if (s == g.current) { pick = s; break; } }
+						for (auto* s : it->second) { if (s == g.current || s == g.wanted) { pick = s; break; } }
+						if (pick) { g_shownScreens[text] = pick; }
 						if (!pick) { for (auto* s : it->second) { if (s->loadNIFData && ModelLoadable(s)) { pick = s; break; } } }
 						if (!pick) { for (auto* s : it->second) { if (ModelLoadable(s)) { pick = s; break; } } }
 						if (!pick)
@@ -335,7 +371,13 @@ namespace modelsync
 							++g.unmatched;
 							logger::warn("hint \"{}\": none of its {} screen(s) has a loadable model; model left as is", text.substr(0, 60), it->second.size());
 						}
-						else { g.wanted = pick; }
+						else if (!pick->loadNIFData || !pick->loadNIFData->loadNIF)
+						{
+							// a text-only screen: the model that is up stays up rather than being cleared
+							g_shownScreens[text] = g.current;
+							logger::debug("hint \"{}\" belongs to {} which has no model; the current model stays", text.substr(0, 60), ScreenName(pick));
+						}
+						else { g.wanted = pick; g_shownScreens[text] = pick; }
 						if (pick)
 						logger::debug("hint changed: \"{}\" -> {}{}", text.substr(0, 60), ScreenName(pick),
 									  it->second.size() > 1 ? std::format(" (one of {} screens with this text)", it->second.size()) : "");
@@ -395,19 +437,25 @@ namespace modelsync
 		void ApplyWanted(const char* a_why)
 		{
 			if (!g.resolved || !g.wanted || g.wanted == g.current) { return; }
-			if (LoadPending())
-			{
-				++g.pendingFrames;
-				if (g.pendingFrames == 600) { logger::warn("a model load has been pending for 600 frames; still waiting to swap to {}", ScreenName(g.wanted)); }
-				return;
-			}
+			// LoadPending() is NOT a gate any more. Measured 2026-09-18 (loop pass diagnostic): the 'loaded' path
+			// the engine keeps at 519829 still read "Interface/Logo/Logo.nif" while the requested shrine was
+			// already on screen, so 'requested != loaded' stayed true for the whole load and no swap was ever
+			// attempted (the owner: "hints cycle but model doesnt change"). The engine's own setter refuses a
+			// call it is not ready for; a refused call is simply retried a few passes later.
+			if (LoadPending()) { ++g.pendingFrames; }
+			if (g_ticksLoop.load() < g_nextTryPass) { return; }
 			if (Apply(g.wanted, a_why))
 			{
 				g.current = g.wanted;
 				++g.applied;
 				g.pendingFrames = 0;
+				g_nextTryPass = g_ticksLoop.load() + 4;   // a quarter second at the loop's ~16 Hz; the last swipe still wins
 			}
-			else { ++g.retries; }
+			else
+			{
+				++g.retries;
+				g_nextTryPass = g_ticksLoop.load() + 8;
+			}
 		}
 
 		void ServePendingNext(RE::LoadingMenu* a_menu)
@@ -459,8 +507,15 @@ namespace modelsync
 				return;
 			}
 			++g_picked;
-			g.wanted = chosen;
+			++g_pickedThisScreen;
 			g.firstTextSeen = true;
+			if (!chosen->loadNIFData || !chosen->loadNIFData->loadNIF)
+			{
+				// A text-only screen: the model that is up stays up rather than being cleared to black.
+				logger::debug("swipe: picked {} which has no model; the current model stays", ScreenName(chosen));
+				return;
+			}
+			g.wanted = chosen;
 			// Applied by ApplyWanted on the drawing thread (see Tick); this callback runs on whichever
 			// thread advanced the movie.
 			logger::debug("swipe: picked {}; the drawing thread will swap to it", ScreenName(chosen));
@@ -621,7 +676,34 @@ namespace modelsync
 		}
 		g_loadingMenu.store(menu.get());
 		g_loadingMovie.store(menu->uiMovie.get());
+		// Hints without a model are taken out of the engine's candidate list for this screen (the owner,
+		// 2026-09-18: "id rather exclude hints without model"): a screen with no NIF, a NIF form that is not a
+		// model, or a model file the game cannot open is erased from loadScreens before the first swipe, so
+		// neither a swipe nor the engine's own pick can land on it. The pre-picked screen is the engine's
+		// choice made before this and is left alone.
+		if (g_settings.enabled && g.resolved)
+		{
+			auto& screens = menu->GetRuntimeData().loadScreens;
+			std::vector<RE::TESLoadScreen*> kept;
+			std::size_t dropped = 0;
+			for (auto* sc : screens)
+			{
+				const bool hasModel = sc && sc->loadNIFData && sc->loadNIFData->loadNIF && sc->loadNIFData->loadNIF->As<RE::TESModel>();
+				if (hasModel && ModelLoadable(sc)) { kept.push_back(sc); } else { ++dropped; }
+			}
+			if (dropped > 0 && !kept.empty())
+			{
+				screens.clear();
+				for (auto* sc : kept) { screens.push_back(sc); }
+				logger::info("{} load screen(s) without a usable model taken out of this screen's candidates; {} left", dropped, kept.size());
+			}
+		}
 		g_ticksMenu = g_ticksAdvance = g_ticksDisplay = 0;
+		g_ticksLoop = 0;
+		g_pickedThisScreen = 0;
+		g_nextTryPass = 0;
+		g_lastSetPass = 0;
+		g_shownScreens.clear();
 		if (g.resolved) { WrapDelegate(menu.get()); }
 		logger::debug("Loading Menu {:#x} movie {:#x} noted", reinterpret_cast<std::uintptr_t>(menu.get()), reinterpret_cast<std::uintptr_t>(menu->uiMovie.get()));
 		if (g.resolved) { PatchMovieVtable(menu->uiMovie.get()); }
@@ -651,6 +733,7 @@ namespace modelsync
 			if (key == "bEnabled") { g_settings.enabled = val == "1" || val == "true"; }
 			else if (key == "uLogLevel") { try { g_settings.logLevel = std::stoi(val); } catch (...) {} }
 			else if (key == "bMinimumLoadingTime") { mintime::GetSettings().enabled = val == "1" || val == "true"; }
+			else if (key == "bHoldCellTransitions") { mintime::GetSettings().cellTransitions = val == "1" || val == "true"; }
 			else if (key == "fMinimumLoadingSeconds") { try { mintime::GetSettings().seconds = std::clamp(std::stof(val), 0.0f, 600.0f); } catch (...) {} }
 		}
 		ApplyLogLevel();
@@ -716,6 +799,7 @@ namespace modelsync
 		}
 		WriteKey(lines, "General", "bEnabled", g_settings.enabled ? "1" : "0");
 		WriteKey(lines, "MinimumTime", "bMinimumLoadingTime", mintime::GetSettings().enabled ? "1" : "0");
+		WriteKey(lines, "MinimumTime", "bHoldCellTransitions", mintime::GetSettings().cellTransitions ? "1" : "0");
 		WriteKey(lines, "MinimumTime", "fMinimumLoadingSeconds", std::format("{:.0f}", mintime::GetSettings().seconds));
 		WriteKey(lines, "Debug", "uLogLevel", std::to_string(g_settings.logLevel));
 		std::ofstream out(path, std::ios::trunc);
@@ -812,6 +896,33 @@ namespace modelsync
 		return true;
 	}
 
+	void OnLoadingFrame()
+	{
+		auto* movie = g_loadingMovie.load();
+		if (!movie || !g_loadingMenu.load() || !g_settings.enabled || !g.resolved) { return; }
+		{
+			static std::atomic<std::uint32_t> seen{ 0 };
+			const std::uint32_t tid = REX::W32::GetCurrentThreadId();
+			if (seen.exchange(tid) != tid) { logger::info("thread: DisplayLoadingScreen loop runs on thread {} (draw thread {})", tid, g_drawThread.load()); }
+			g_drawThread.store(tid);
+		}
+		const auto n = ++g_ticksLoop;
+		// Diagnostic (2026-09-18, the owner: 'the model never appeared'): what the engine's loading scene says
+		// while the screen is up - once early, then every 300 passes.
+		if (n == 5 || n % 300 == 0)
+		{
+			const auto scene = g.scenePtrAddr ? *reinterpret_cast<std::uint8_t**>(g.scenePtrAddr) : nullptr;
+			const auto req = g.requestedPathAddr ? *reinterpret_cast<const char**>(g.requestedPathAddr) : nullptr;
+			const auto ld = g.loadedPathAddr ? *reinterpret_cast<const char**>(g.loadedPathAddr) : nullptr;
+			std::string hint; ReadHint(movie, hint);
+			logger::info("loop pass {}: scene={} flag135={} requested=\"{}\" loaded=\"{}\" pending={} wanted={} current={} hint=\"{}\"",
+				n, static_cast<const void*>(scene), scene ? static_cast<int>(scene[0x135]) : -1, req ? req : "(null)", ld ? ld : "(null)",
+				LoadPending(), ScreenName(g.wanted), ScreenName(g.current), hint.substr(0, 40));
+		}
+		Tick(movie);
+		ApplyWanted("loop");
+	}
+
 	std::string StateJson()
 	{
 		std::string textPath, lastText;
@@ -829,12 +940,12 @@ namespace modelsync
 			"\"installed\":{},\"runtimeSupported\":{},\"resolved\":{},\"enabled\":{},\"screens\":{},\"screensWithText\":{},"
 			"\"distinctTexts\":{},\"textPath\":\"{}\",\"lastText\":\"{}\",\"current\":\"{}\",\"wanted\":\"{}\","
 			"\"applied\":{},\"retries\":{},\"pendingFrames\":{},\"unmatched\":{},\"loadPending\":{},\"requestedPath\":\"{}\","
-			"\"ticksMenu\":{},\"ticksAdvance\":{},\"ticksDisplay\":{},\"advanceOther\":{},\"movieNoted\":{},"
+			"\"ticksLoop\":{},\"ticksMenu\":{},\"ticksAdvance\":{},\"ticksDisplay\":{},\"advanceOther\":{},\"movieNoted\":{},"
 			"\"requests\":{},\"picked\":{},\"msgUpdate\":{},\"msgOther\":{},\"pendingNext\":{},\"servedNext\":{}",
 			g.installed, g.runtimeSupported, g.resolved, g_settings.enabled, g.screens, g.screensWithText, g.byText.size(),
 			esc(textPath), esc(lastText), ScreenName(g.current), ScreenName(g.wanted),
 			g.applied, g.retries, g.pendingFrames, g.unmatched, g.resolved ? LoadPending() : false, esc(RequestedPath()),
-			g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr,
+			g_ticksLoop.load(), g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr,
 			g_requests.load(), g_picked.load(), g_msgUpdate.load(), g_msgOther.load(), g_pendingNext.load(), g_servedNext.load()) + "," + mintime::StateJson();
 	}
 }

@@ -1,4 +1,4 @@
-Loading Menu Overhaul - Model Sync
+Loading Menu Overhaul Model Sync
 Version 1.0.0
 
 WHAT THIS IS

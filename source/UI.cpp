@@ -1,4 +1,4 @@
-// Loading Menu Overhaul - Model Sync: the settings page, drawn inside the Apocrypha Menu Framework (memory:
+// Loading Menu Overhaul Model Sync: the settings page, drawn inside the Apocrypha Menu Framework (memory:
 // every mod of ours keeps its settings inside AMF as its own mod menu). Two things live here - whether the model
 // follows the swiped hint, and the minimum loading screen time (the owner, 2026-09-18, default 20 s) - plus Save,
 // Reload, Restore defaults and the log level. Every string goes through strings::TR, so the eleven translation
@@ -148,6 +148,8 @@ namespace UI
 			NudgeableSlider(strings::TR("LMS_MinSeconds", "Minimum seconds"), &m.seconds, 0.0F, 120.0F, "%.0f s", 1.0F);
 			ImGuiMCP::PopItemWidth();
 			HelpMarker(strings::TR("LMS_HelpMinSeconds", "Counted from the moment the loading screen appears. 20 by default; 0 turns the minimum off. A load that takes longer than this is never held."));
+			ImGuiMCP::Toggle(strings::TR("LMS_MinCells", "Also hold door and fast-travel loads"), &m.cellTransitions);
+			HelpMarker(strings::TR("LMS_HelpMinCells", "Off: only a load from the main menu is held; a door or fast travel ends when the game is ready. On: those are held too - but Loading Menu Overhaul's prompt art and hint cycling can stall during that hold until you press a bumper, so this stays off until that is solved."));
 		}
 
 		ImGuiMCP::SeparatorText(strings::TR("LMS_SecDebug", "Debug"));

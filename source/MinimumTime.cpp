@@ -1,6 +1,7 @@
 #include "PCH.h"
 
 #include "MinimumTime.h"
+#include "ModelSync.h"
 
 #include "utils/Logger.h"
 
@@ -97,6 +98,9 @@ namespace mintime
 
 		bool Hook(int a_which)
 		{
+			// Every pass of the loading-screen loop, on the thread that draws it: the model swap's one
+			// safe moment (see ModelSync.cpp, ApplyWanted). Runs whether or not a hold is in progress.
+			modelsync::OnLoadingFrame();
 			const bool loading = g_orig(a_which);
 			if (a_which != kLoadingState || loading) { return loading; }
 			return HoldDone("game load");
@@ -106,6 +110,11 @@ namespace mintime
 		{
 			const bool pending = g_origPending();
 			if (pending) { return true; }
+			// A cell transition is held only when asked: while the main thread spins in this wait loop it runs
+			// none of its normal update, so Loading Menu Overhaul's queued UI work (its prompt art, its 'use
+			// gamepad' reply) is not delivered until an input event lands - the owner, 2026-09-18: 'the ui shows
+			// fine on the menu to game load but acts odd when going to another cell'. Off by default.
+			if (!GetSettings().cellTransitions) { return false; }
 			return HoldDone("cell transition");
 		}
 

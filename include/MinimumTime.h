@@ -32,6 +32,7 @@ namespace mintime
 	{
 		bool enabled{ true };
 		float seconds{ 20.0f };   // fMinimumLoadingSeconds:MinimumTime - 0 = off
+		bool cellTransitions{ false };   // bHoldCellTransitions:MinimumTime - hold door/fast-travel loads too (off: Loading Menu Overhaul's UI stalls there, 2026-09-18)
 	};
 	Settings& GetSettings();
 

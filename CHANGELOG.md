@@ -1,4 +1,4 @@
-# Changelog - Loading Menu Overhaul - Model Sync
+# Changelog - Loading Menu Overhaul Model Sync
 
 ## 1.0.1 - 2026-09-18 - untested
 

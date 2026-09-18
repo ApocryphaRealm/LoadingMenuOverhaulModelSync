@@ -1,4 +1,4 @@
-# Loading Menu Overhaul - Model Sync - copyright and licence
+# Loading Menu Overhaul Model Sync - copyright and licence
 
 Copyright (C) 2026 ApocryphaRealm
 

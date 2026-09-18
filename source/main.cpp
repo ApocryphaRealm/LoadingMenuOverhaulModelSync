@@ -1,4 +1,4 @@
-// Loading Menu Overhaul - Model Sync. Own code, GPL-3.0-or-later (2026-09-17).
+// Loading Menu Overhaul Model Sync. Own code, GPL-3.0-or-later (2026-09-17).
 //
 // Makes the loading screen's 3D model follow the hint text when Loading Menu Overhaul (Nexus
 // 149874) swipes between hints. See include/ModelSync.h for how the engine behaves and what this
@@ -65,7 +65,7 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 	SKSE::log::init(modelsync::kLogName);
 	// Address Library pre-check (the guard every mod of ours carries): when the file for this game is
 	// missing the plugin loads inert with a message that names it, instead of CommonLib's unreadable fail.
-	if (!AddressLibraryGuard::Guard("Loading Menu Overhaul - Model Sync"))
+	if (!AddressLibraryGuard::Guard("Loading Menu Overhaul Model Sync"))
 	{
 		return true;
 	}

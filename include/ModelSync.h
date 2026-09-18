@@ -1,6 +1,6 @@
 #pragma once
 
-// Loading Menu Overhaul - Model Sync. Own code, GPL-3.0-or-later (2026-09-17).
+// Loading Menu Overhaul Model Sync. Own code, GPL-3.0-or-later (2026-09-17).
 //
 // WHAT THE GAME DOES. When the Loading Menu first updates, the engine filters every TESLoadScreen by
 // its conditions, picks one at random, hands its model (the load NIF, scale, rotation, translation
@@ -26,7 +26,7 @@
 namespace modelsync
 {
 	inline constexpr const char* kLogName = "LoadingMenuOverhaulModelSync";
-	inline constexpr const char* kDisplayName = "Loading Menu Overhaul - Model Sync";
+	inline constexpr const char* kDisplayName = "Loading Menu Overhaul Model Sync";
 	inline constexpr const char* kIniName = "LoadingMenuOverhaulModelSync.ini";
 
 	// Installs the AdvanceMovie hook and builds the text -> load screen table. kDataLoaded.
@@ -38,6 +38,10 @@ namespace modelsync
 	// Remember (or forget) the Loading Menu and its movie, and hook the movie's Advance the first
 	// time it is seen. Called from the menu open/close event.
 	void NoteLoadingMenu(bool a_open);
+	// One iteration of the engine's loading-screen loop (DisplayLoadingScreen, the thread that draws the
+	// loading screen), called from the minimum-time hook every pass: reads the hint and applies a wanted
+	// swap there, on the drawing thread, between two draws.
+	void OnLoadingFrame();
 
 	// Apply a load screen's model now, by hand (DevBench). Returns false if it has no model or the
 	// engine function is not resolved.

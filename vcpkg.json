@@ -1,7 +1,7 @@
 ﻿{
     "name": "loadingmenuoverhaulmodelsync",
     "version-string": "1.0.1",
-    "description": "Loading Menu Overhaul - Model Sync. When Loading Menu Overhaul cycles the loading-screen hint, the 3D model on screen follows it.",
+    "description": "Loading Menu Overhaul Model Sync. When Loading Menu Overhaul cycles the loading-screen hint, the 3D model on screen follows it.",
     "homepage": "https://github.com/ApocryphaRealm/LoadingMenuOverhaulModelSync",
     "license": "GPL-3.0-or-later",
     "dependencies": [
