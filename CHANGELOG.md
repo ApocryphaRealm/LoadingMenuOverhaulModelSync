@@ -1,5 +1,16 @@
 # Changelog - Loading Menu Overhaul - Model Sync
 
+## 1.0.1 - 2026-09-18 - untested
+
+### Added
+- **A minimum loading-screen time** (the owner: a settings page with a minimum the player can set, default 20 seconds). The game-load loop's state check (id 38085) and the cell transition's wait (id 39366) are held until the time has passed, so the swapped model is on screen long enough to be seen on a fast machine. Settings page inside Apocrypha Menu Framework: swap on/off, minimum on/off and seconds, log level; INI `[MinimumTime] bMinimumLoadingTime`, `fMinimumLoadingSeconds`.
+
+### Fixed
+- **Every model swap now happens on the thread that draws the loading screen**, from the loading movie's Advance/Display hooks, before the engine's draw - never from LoadingMenu::AdvanceMovie, ProcessMessage or the RequestLoadingText callback, which the game runs on the main thread and on several JobList threads (measured 2026-09-18: AdvanceMovie on the game thread, ProcessMessage on four different threads across four loads, Display on a different thread per load). crash-2026-09-18-05-02-11 was a null node while the JobList thread drew the loading movie through this plugin's Display hook; a swap or movie call from another thread during that draw is the nearest cause. The hint and swipe paths only record the wanted screen now.
+- **A screen whose model the game cannot open is never swapped to** (crash-2026-09-18-05-02-11: an access violation in the engine's NIF loader under DisplayLoadingScreen with this plugin's swap on the stack). A screen is picked by hint text, which can be one the engine's own conditions would never show, and its NIF can be missing or broken; every screen's model is now probed through the game's resource layer before it is requested, the answer cached, and a hint whose screens all fail leaves the model as it is.
+- The previous run's log is kept as `.prev`, so a crash's context survives the next launch.
+- Carries the Address Library guard: with the file for the game missing, the plugin loads inert and says so.
+
 ## 1.0.0
 
 * First version. When Loading Menu Overhaul swipes to another loading-screen hint, the 3D model on

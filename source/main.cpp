@@ -6,8 +6,12 @@
 #include "PCH.h"
 
 #include "DevBenchTool.h"
+#include "MinimumTime.h"
 #include "ModelSync.h"
+#include "UI.h"
 #include "utils/Logger.h"
+#include "utils/AddressLibraryGuard.h"
+#include "utils/Strings.h"
 
 namespace
 {
@@ -27,6 +31,7 @@ namespace
 				logger::debug("Loading Menu {}", a_event->opening ? "opened" : "closed");
 				modelsync::Reset();
 				modelsync::NoteLoadingMenu(a_event->opening);
+				mintime::NoteLoadingMenu(a_event->opening);
 			}
 			return RE::BSEventNotifyControl::kContinue;
 		}
@@ -40,7 +45,10 @@ namespace
 			DevBenchTool::Init(false);
 			break;
 		case SKSE::MessagingInterface::kDataLoaded:
+			strings::Configure("LoadingMenuOverhaulModelSync");
 			modelsync::Install();
+			mintime::Install();
+			UI::Register();
 			if (auto* ui = RE::UI::GetSingleton()) { ui->AddEventSink<RE::MenuOpenCloseEvent>(MenuWatcher::GetSingleton()); }
 			else { logger::error("RE::UI singleton is null at kDataLoaded; menu open/close will not reset the sync"); }
 			DevBenchTool::Init(true);
@@ -55,6 +63,14 @@ SKSEPluginLoad(const SKSE::LoadInterface* a_skse)
 {
 	SKSE::Init(a_skse);
 	SKSE::log::init(modelsync::kLogName);
+	// Address Library pre-check (the guard every mod of ours carries): when the file for this game is
+	// missing the plugin loads inert with a message that names it, instead of CommonLib's unreadable fail.
+	if (!AddressLibraryGuard::Guard("Loading Menu Overhaul - Model Sync"))
+	{
+		return true;
+	}
+	// The minimum-time hooks write three 5-byte calls through the trampoline.
+	SKSE::AllocTrampoline(64);
 
 	modelsync::LoadSettings();
 	SKSE::log::describe_level(modelsync::kIniName);

@@ -1,10 +1,15 @@
 #include "PCH.h"
 
 #include "ModelSync.h"
+
+#include "MinimumTime.h"
 #include "utils/Logger.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <filesystem>
+#include <format>
 #include <cstring>
 #include <fstream>
 #include <mutex>
@@ -142,9 +147,41 @@ namespace modelsync
 
 		// The model, scale, rotation, translation, camera path and offsets of a screen, exactly as
 		// the engine's own setup derives them (defaults for a screen with no NIF data).
+		// Can the engine load this screen's model? A screen picked by hint text may be one the engine's own
+		// conditions would never show, and its NIF may be missing or broken (a mod's screen); the NIF loader
+		// then crashes on the JobList thread (crash-2026-09-18-05-02-11: SkyrimSE.exe 85721 null read under
+		// DisplayLoadingScreen with this plugin's swap on the stack). The file is probed through the game's
+		// own resource layer (loose files and archives alike) and the answer cached per screen.
+		std::unordered_map<const RE::TESLoadScreen*, bool> g_loadable;
+
+		bool ModelLoadable(RE::TESLoadScreen* a_screen)
+		{
+			if (!a_screen) { return false; }
+			auto it = g_loadable.find(a_screen);
+			if (it != g_loadable.end()) { return it->second; }
+			bool ok = true;
+			std::string path;
+			if (auto* nif = a_screen->loadNIFData; nif && nif->loadNIF)
+			{
+				if (auto* model = nif->loadNIF->As<RE::TESModel>(); model && model->GetModel() && *model->GetModel())
+				{
+					path = model->GetModel();
+					std::string full = path;
+					const bool prefixed = full.size() > 7 && (full.compare(0, 7, "meshes\\") == 0 || full.compare(0, 7, "meshes/") == 0 || full.compare(0, 7, "Meshes\\") == 0 || full.compare(0, 7, "Meshes/") == 0);
+					if (!prefixed) { full = "meshes\\" + full; }
+					RE::BSResourceNiBinaryStream stream(full);
+					ok = stream.good();
+				}
+			}
+			if (!ok) { logger::warn("{}: its model \"{}\" cannot be opened through the game's resources; this screen will not be swapped to", ScreenName(a_screen), path); }
+			g_loadable.emplace(a_screen, ok);
+			return ok;
+		}
+
 		bool Apply(RE::TESLoadScreen* a_screen, const char* a_why)
 		{
 			if (!g.setModel) { return false; }
+			if (!ModelLoadable(a_screen)) { return false; }
 			RE::TESModel* model = nullptr;
 			float scale = 1.0f;
 			RE::NiPoint3 rotation{ 0.0f, 0.0f, 0.0f };
@@ -177,7 +214,7 @@ namespace modelsync
 			g.setModel(model, scale, &rotation, &translation, camera, offset0, offset1);
 			const std::string after = RequestedPath();
 			const bool accepted = model ? (after == modelPath) : true;
-			logger::debug("{}: set model \"{}\" scale {:.2f} rot ({:.2f},{:.2f},{:.2f}) trans ({:.1f},{:.1f},{:.1f}) cam \"{}\" off {}/{} -> {}",
+			logger::info("{}: set model \"{}\" scale {:.2f} rot ({:.2f},{:.2f},{:.2f}) trans ({:.1f},{:.1f},{:.1f}) cam \"{}\" off {}/{} -> {}",
 						  a_why, modelPath, scale, rotation.x, rotation.y, rotation.z, translation.x, translation.y, translation.z,
 						  camera, offset0, offset1, accepted ? "accepted" : "NOT accepted (load pending)");
 			return accepted;
@@ -291,31 +328,27 @@ namespace modelsync
 					{
 						RE::TESLoadScreen* pick = nullptr;
 						for (auto* s : it->second) { if (s == g.current) { pick = s; break; } }
-						if (!pick) { for (auto* s : it->second) { if (s->loadNIFData) { pick = s; break; } } }
-						if (!pick) { pick = it->second.front(); }
-						g.wanted = pick;
+						if (!pick) { for (auto* s : it->second) { if (s->loadNIFData && ModelLoadable(s)) { pick = s; break; } } }
+						if (!pick) { for (auto* s : it->second) { if (ModelLoadable(s)) { pick = s; break; } } }
+						if (!pick)
+						{
+							++g.unmatched;
+							logger::warn("hint \"{}\": none of its {} screen(s) has a loadable model; model left as is", text.substr(0, 60), it->second.size());
+						}
+						else { g.wanted = pick; }
+						if (pick)
 						logger::debug("hint changed: \"{}\" -> {}{}", text.substr(0, 60), ScreenName(pick),
 									  it->second.size() > 1 ? std::format(" (one of {} screens with this text)", it->second.size()) : "");
 					}
 				}
 			}
 
-			if (g.wanted && g.wanted != g.current)
-			{
-				if (LoadPending())
-				{
-					++g.pendingFrames;
-					if (g.pendingFrames == 600) { logger::warn("a model load has been pending for 600 frames; still waiting to swap to {}", ScreenName(g.wanted)); }
-					return;
-				}
-				if (Apply(g.wanted, "hint"))
-				{
-					g.current = g.wanted;
-					++g.applied;
-					g.pendingFrames = 0;
-				}
-				else { ++g.retries; }
-			}
+			// The swap itself is NOT done here. Tick runs on whichever thread advanced the movie - the
+			// main thread through LoadingMenu::AdvanceMovie or ProcessMessage during a game load - while
+			// the JobList thread's DisplayLoadingScreen loop draws the 3D scene; a model replaced under
+			// a traversal in progress is a null node (crash-2026-09-18-05-02-11: SkyrimSE.exe 85721 under the
+			// engine's own movie Display, called from this plugin's Display hook). ApplyWanted runs from the
+			// movie's Advance/Display hooks, on the drawing thread, between two draws.
 		}
 
 		// The per-frame tick. IMenu::AdvanceMovie on the LoadingMenu is only called while the game's
@@ -356,9 +389,18 @@ namespace modelsync
 
 		// A pick deferred because the previous model was still loading is applied at the next
 		// opportunity the game thread gives us - any menu message or advance - not only on kUpdate.
-		void RetryDeferred(const char* a_why)
+		// The one place a model is swapped: called from the loading movie's Advance and Display hooks,
+		// i.e. on the thread that draws the loading-screen scene, before the engine's own draw runs.
+		std::atomic<std::uint32_t> g_drawThread{ 0 };
+		void ApplyWanted(const char* a_why)
 		{
-			if (!g.resolved || !g.wanted || g.wanted == g.current || LoadPending()) { return; }
+			if (!g.resolved || !g.wanted || g.wanted == g.current) { return; }
+			if (LoadPending())
+			{
+				++g.pendingFrames;
+				if (g.pendingFrames == 600) { logger::warn("a model load has been pending for 600 frames; still waiting to swap to {}", ScreenName(g.wanted)); }
+				return;
+			}
 			if (Apply(g.wanted, a_why))
 			{
 				g.current = g.wanted;
@@ -370,7 +412,6 @@ namespace modelsync
 
 		void ServePendingNext(RE::LoadingMenu* a_menu)
 		{
-			RetryDeferred("deferred");
 			if (!a_menu || !a_menu->uiMovie || g_pendingNext.load() == 0) { return; }
 			--g_pendingNext;
 			++g_servedNext;
@@ -420,18 +461,9 @@ namespace modelsync
 			++g_picked;
 			g.wanted = chosen;
 			g.firstTextSeen = true;
-			if (LoadPending())
-			{
-				++g.retries;
-				logger::debug("swipe: picked {} but a model load is still pending; deferred", ScreenName(chosen));
-				return;
-			}
-			if (Apply(chosen, "swipe"))
-			{
-				g.current = chosen;
-				++g.applied;
-			}
-			else { ++g.retries; }
+			// Applied by ApplyWanted on the drawing thread (see Tick); this callback runs on whichever
+			// thread advanced the movie.
+			logger::debug("swipe: picked {}; the drawing thread will swap to it", ScreenName(chosen));
 		}
 
 		struct Processor : RE::FxDelegateHandler::CallbackProcessor
@@ -493,6 +525,7 @@ namespace modelsync
 
 			static RE::UI_MESSAGE_RESULTS ProcessMessage(RE::LoadingMenu* a_this, RE::UIMessage& a_message)
 			{
+				static std::atomic<std::uint32_t> seen{ 0 }; NoteThread("LoadingMenu::ProcessMessage", seen);
 				if (a_message.type.get() == RE::UI_MESSAGE_TYPE::kUpdate)
 				{
 					++g_msgUpdate;
@@ -503,18 +536,27 @@ namespace modelsync
 				return g.originalProcessMessage(a_this, a_message);
 			}
 
+			static void NoteThread(const char* a_hook, std::atomic<std::uint32_t>& a_seen)
+			{
+				const std::uint32_t tid = REX::W32::GetCurrentThreadId();
+				if (a_seen.exchange(tid) != tid) { logger::info("thread: {} runs on thread {} (draw thread {})", a_hook, tid, g_drawThread.load()); }
+			}
 			static void AdvanceMovie(RE::LoadingMenu* a_this, float a_interval, std::uint32_t a_currentTime)
 			{
+				static std::atomic<std::uint32_t> seen{ 0 }; NoteThread("LoadingMenu::AdvanceMovie", seen);
 				g.originalAdvanceMovie(a_this, a_interval, a_currentTime);
 				++g_ticksMenu;
+				mintime::Tick();
 				if (a_this && a_this->uiMovie) { Tick(a_this->uiMovie.get()); }
 				ServePendingNext(a_this);
 			}
 
 			static float MovieAdvance(RE::GFxMovieView* a_this, float a_deltaT, std::uint32_t a_frameCatchUpCount)
 			{
+				const bool ours = g_loadingMenu.load() && IsLoadingMovie(a_this);
+				if (ours) { static std::atomic<std::uint32_t> seen{ 0 }; NoteThread("GFxMovieView::Advance (loading movie)", seen); ApplyWanted("advance"); }
 				const float r = g_originalMovieAdvance ? g_originalMovieAdvance(a_this, a_deltaT, a_frameCatchUpCount) : 0.0f;
-				if (g_loadingMenu.load() && IsLoadingMovie(a_this))
+				if (ours)
 				{
 					++g_ticksAdvance;
 					Tick(a_this);
@@ -525,11 +567,20 @@ namespace modelsync
 
 			static void MovieDisplay(RE::GFxMovieView* a_this)
 			{
+				const bool ours = g_loadingMenu.load() && IsLoadingMovie(a_this);
+				if (ours)
+				{
+					// This is the thread that draws the loading-screen scene (the crash stack: DisplayLoadingScreen ->
+					// this hook -> the engine's Display). The swap happens here, BEFORE the draw, never during it.
+					g_drawThread.store(REX::W32::GetCurrentThreadId());
+					static std::atomic<std::uint32_t> seen{ 0 }; NoteThread("GFxMovieView::Display (loading movie)", seen);
+					Tick(a_this);
+					ApplyWanted("display");
+				}
 				if (g_originalMovieDisplay) { g_originalMovieDisplay(a_this); }
-				if (g_loadingMenu.load() && IsLoadingMovie(a_this))
+				if (ours)
 				{
 					++g_ticksDisplay;
-					Tick(a_this);
 				}
 			}
 		};
@@ -581,6 +632,7 @@ namespace modelsync
 	void LoadSettings()
 	{
 		g_settings = Settings{};
+		mintime::GetSettings() = mintime::Settings{};
 		std::filesystem::path path = "Data/SKSE/Plugins";
 		path /= kIniName;
 		std::ifstream in(path);
@@ -598,9 +650,79 @@ namespace modelsync
 			const std::string val = Normalise(line.substr(eq + 1));
 			if (key == "bEnabled") { g_settings.enabled = val == "1" || val == "true"; }
 			else if (key == "uLogLevel") { try { g_settings.logLevel = std::stoi(val); } catch (...) {} }
+			else if (key == "bMinimumLoadingTime") { mintime::GetSettings().enabled = val == "1" || val == "true"; }
+			else if (key == "fMinimumLoadingSeconds") { try { mintime::GetSettings().seconds = std::clamp(std::stof(val), 0.0f, 600.0f); } catch (...) {} }
 		}
+		ApplyLogLevel();
+	}
+
+	void ApplyLogLevel()
+	{
 		const auto level = g_settings.logLevel <= 0 ? spdlog::level::trace : g_settings.logLevel == 1 ? spdlog::level::debug : spdlog::level::info;
 		SKSE::log::set_level(level, level);
+	}
+
+	void RestoreDefaults()
+	{
+		g_settings = Settings{};
+		mintime::GetSettings() = mintime::Settings{};
+		ApplyLogLevel();
+	}
+
+	namespace
+	{
+		// Sets key=value inside [section], adding the section or the key when absent; comments and order are kept.
+		void WriteKey(std::vector<std::string>& a_lines, const std::string& a_section, const std::string& a_key, const std::string& a_value)
+		{
+			int sectionStart = -1, sectionEnd = static_cast<int>(a_lines.size());
+			for (int i = 0; i < static_cast<int>(a_lines.size()); ++i)
+			{
+				const auto& l = a_lines[i];
+				if (!l.empty() && l[0] == '[')
+				{
+					if (sectionStart >= 0) { sectionEnd = i; break; }
+					if (l == "[" + a_section + "]") { sectionStart = i; }
+				}
+			}
+			if (sectionStart < 0)
+			{
+				if (!a_lines.empty() && !a_lines.back().empty()) { a_lines.push_back(""); }
+				a_lines.push_back("[" + a_section + "]");
+				a_lines.push_back(a_key + "=" + a_value);
+				return;
+			}
+			for (int i = sectionStart + 1; i < sectionEnd; ++i)
+			{
+				const auto& l = a_lines[i];
+				const auto eq = l.find('=');
+				if (eq == std::string::npos || l.empty() || l[0] == ';') { continue; }
+				if (Normalise(l.substr(0, eq)) == a_key) { a_lines[i] = a_key + "=" + a_value; return; }
+			}
+			int insertAt = sectionEnd;
+			while (insertAt > sectionStart + 1 && a_lines[insertAt - 1].empty()) { --insertAt; }
+			a_lines.insert(a_lines.begin() + insertAt, a_key + "=" + a_value);
+		}
+	}
+
+	bool SaveSettings()
+	{
+		std::filesystem::path path = "Data/SKSE/Plugins";
+		path /= kIniName;
+		std::vector<std::string> lines;
+		{
+			std::ifstream in(path);
+			std::string line;
+			while (in && std::getline(in, line)) { lines.push_back(line); }
+		}
+		WriteKey(lines, "General", "bEnabled", g_settings.enabled ? "1" : "0");
+		WriteKey(lines, "MinimumTime", "bMinimumLoadingTime", mintime::GetSettings().enabled ? "1" : "0");
+		WriteKey(lines, "MinimumTime", "fMinimumLoadingSeconds", std::format("{:.0f}", mintime::GetSettings().seconds));
+		WriteKey(lines, "Debug", "uLogLevel", std::to_string(g_settings.logLevel));
+		std::ofstream out(path, std::ios::trunc);
+		if (!out) { logger::error("Save: could not open {} for writing", path.string()); return false; }
+		for (const auto& line : lines) { out << line << '\n'; }
+		logger::info("settings saved to {}", path.string());
+		return true;
 	}
 
 	void Reset()
@@ -713,6 +835,6 @@ namespace modelsync
 			esc(textPath), esc(lastText), ScreenName(g.current), ScreenName(g.wanted),
 			g.applied, g.retries, g.pendingFrames, g.unmatched, g.resolved ? LoadPending() : false, esc(RequestedPath()),
 			g_ticksMenu.load(), g_ticksAdvance.load(), g_ticksDisplay.load(), g_advanceOther.load(), g_loadingMovie.load() != nullptr,
-			g_requests.load(), g_picked.load(), g_msgUpdate.load(), g_msgOther.load(), g_pendingNext.load(), g_servedNext.load());
+			g_requests.load(), g_picked.load(), g_msgUpdate.load(), g_msgOther.load(), g_pendingNext.load(), g_servedNext.load()) + "," + mintime::StateJson();
 	}
 }

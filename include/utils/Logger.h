@@ -21,6 +21,17 @@ namespace SKSE::log
 
 		std::filesystem::path path = *log_directory() / a_log_name;
 		path += ".log";
+		// Keep the previous run's log as .prev: a crash overwrote by the next launch has no context
+		// (2026-09-18 - the Model Sync log of a loading-screen crash was gone before it could be read).
+		{
+			std::error_code ec;
+			if (std::filesystem::exists(path, ec))
+			{
+				std::filesystem::path prev = path; prev += ".prev";
+				std::filesystem::remove(prev, ec);
+				std::filesystem::rename(path, prev, ec);
+			}
+		}
 		std::shared_ptr<spdlog::logger> log = spdlog::basic_logger_mt("global log", path.string(), true);
 
 		spdlog::set_default_logger(std::move(log));

@@ -56,4 +56,9 @@ namespace modelsync
 	};
 	Settings& GetSettings();
 	void LoadSettings();
+	// 1.0.0 (settings page): write every setting back to the INI (keeps comments and order), restore the compiled
+	// defaults, and apply the log level.
+	bool SaveSettings();
+	void RestoreDefaults();
+	void ApplyLogLevel();
 }
