@@ -57,7 +57,7 @@ SETTINGS
         bMinimumLoadingTime=1      hold a load from the main menu for the minimum time
         fMinimumLoadingSeconds=20  the minimum, in seconds; 0 turns it off
         bHoldCellTransitions=0     hold door and fast-travel loads too (see above)
-        uLogLevel=1                0 trace, 1 debug, 2 info (1 is the shipped level)
+        uLogLevel=0                0 trace (shipped, so a bug report's log is complete), 1 debug, 2 info
 
 DEBUGGING
     Documents\My Games\Skyrim Special Edition\SKSE\LoadingMenuOverhaulModelSync.log (the previous run's log is kept as .prev)
